@@ -1,4 +1,5 @@
 #include "head.h"
+#include <cstring>
 /**
  * Compute the number of bytes required to serialize record
  */
@@ -28,7 +29,7 @@ void fixed_len_write(Record *record, void *buf){
 void fixed_len_read(void *buf, int size, Record *record){
     int offset = 0;
     for (int i = 0; i < record->size(); i++){
-        memcpy(record->at(i), (char*)buf + offset, strlen(record->at(i)));
+        memcpy((void *)record->at(i), (char*)buf + offset, strlen(record->at(i)));
         offset += strlen(record->at(i));
     }
 }
@@ -67,9 +68,18 @@ void var_len_read(void *buf, int size, Record *record){
         int len;
         memcpy(&len, (char*)buf + offset, sizeof(int));
         offset += sizeof(int);
-        memcpy(record->at(i), (char*)buf + offset, len);
+        memcpy((void*)record->at(i), (char*)buf + offset, len);
         offset += len;
     }
+}
+
+int fixed_len_page_directory_offset(Page *page) {
+    // Calculate the byte offset where the directory starts.
+    return page->page_size - ceil((floor((float)page->page_size/(float)page->slot_size))/8);
+}
+
+unsigned char* get_directory(Page* page){
+    return (unsigned char*)page->data + fixed_len_page_directory_offset(page);
 }
 
 
@@ -84,18 +94,23 @@ void init_fixed_len_page(Page *page, int page_size, int slot_size){
     page->free_slot_begin = 0;
 }
  
+
+bool is_freeslot(Page* page, int slot){
+    unsigned char directory = *(get_directory(page) + slot / 8);
+    return (directory & (1 << (slot % 8))) == 0;
+}
+
 /**
  * Calculates the maximal number of records that fit in a page
  */
-int fixed_len_page_capacity(Page *page){
-    return page->page_size / page->slot_size;
+int fixed_len_page_capacity(Page *page) {
+    return (fixed_len_page_directory_offset(page))/page->slot_size;
 }
- 
 /**
  * Calculate the free space (number of free slots) in the page
  */
 int fixed_len_page_freeslots(Page *page){
-    return page->page_size / page->slot_size - page->free_slot_begin;
+    return fixed_len_page_freeslot_indices(page).size();
 }
  
 /**
@@ -105,29 +120,89 @@ int fixed_len_page_freeslots(Page *page){
  *   -1 if unsuccessful (page full)
  */
 int add_fixed_len_page(Page *page, Record *r){
-    int slot = fixed_len_page_freeslots(page);
-    if (slot == -1){
-        return -1;
+    unsigned char* directory_offset = get_directory(page);
+
+    //Iterate slots directory to find a free one.
+    for(int i = 0; i < fixed_len_page_capacity(page); i++){
+        if(i > 0 && i%8 == 0)
+            directory_offset++;
+
+        unsigned char directory = *directory_offset;
+
+        if(directory >> (i%8) == 0){
+            //Write record to page.
+            fixed_len_write(r, ((char*)page->data) + i*page->slot_size);
+
+            //Update directory.
+            directory |= 1 << (i%8);
+            memcpy(directory_offset, &directory, 1);
+            return i;
+        }
     }
-    write_fixed_len_page(page, slot, r);
-    return slot;
+
+    //Reached here means we didn't find any free slots.
+    return -1;
 }
  
 /**
  * Write a record into a given slot.
  */
 void write_fixed_len_page(Page *page, int slot, Record *r){
-    int offset = slot * page->slot_size;
-    fixed_len_write(r, (char*)page->data + offset);
+    //Check that slot is in valid space.
+    if(slot >= fixed_len_page_capacity(page))
+        return;
+
+    //Get byte position of slot in the directory.
+    unsigned char* directory_offset = get_directory(page);
+    directory_offset += slot/8;
+
+    //Update directory, set as written.
+    unsigned char directory = *directory_offset;
+    directory |= 1 << (slot%8);
+    memcpy(directory_offset, &directory, 1);
+
+    //Write record to slot.
+    unsigned char* slot_ptr = ((unsigned char*)page->data) + page->slot_size*slot;
+    fixed_len_write(r, slot_ptr);
 }
  
 /**
  * Read a record from the page from a given slot.
  */
 void read_fixed_len_page(Page *page, int slot, Record *r){
-    int offset = slot * page->slot_size;
-    fixed_len_read((char*)page->data + offset, page->slot_size, r);
+    //Check that slot is in valid space.
+    if(slot >= fixed_len_page_capacity(page))
+        return;
+
+    //It is up to the caller to make sure the requested slot is actually not empty.
+    char* slot_ptr = (char*)page->data + (page->slot_size * slot);
+    fixed_len_read(slot_ptr, page->slot_size, r);
 }
 
+void free_fixed_len_page(Page* page){
+    //Free data buffer.
+    free(page->data);
+    page->data = 0;
+    page->page_size = 0;
+}
 
+std::vector<int> fixed_len_page_freeslot_indices(Page *page) {
+    std::vector<int> freeslots;
 
+    //Get directory.
+    unsigned char* directory_offset = get_directory(page);
+
+    //Loop over directory to see which records are free.
+    for(int i = 0; i < fixed_len_page_capacity(page); i++) {
+        if(i > 0 && i%8 == 0)
+            directory_offset++;
+
+        unsigned char directory = *directory_offset;
+
+        if((directory & (1 << (i%8))) == 0){
+            freeslots.push_back(i);
+        }
+    }
+
+    return freeslots;
+}
